@@ -1,0 +1,9 @@
+pyrogram
+tgcrypto
+google-api-python-client
+google-auth
+requests
+python-dotenv
+tinydb
+aiofiles
+flask
