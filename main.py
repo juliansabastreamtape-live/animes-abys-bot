@@ -1,12 +1,5 @@
 # main.py (Versión completa y actualizada)
 import asyncio
-# --- Forzar la creación de un event loop antes de importar pyrogram ---
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-# ---------------------------------------------------------------------
 import os
 import threading
 import time
@@ -832,3 +825,4 @@ if __name__ == "__main__":
         traceback.print_exc()
     
     print("pyrogram_app.run() ha terminado.")
+
