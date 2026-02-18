@@ -156,51 +156,99 @@ async def upload_to_drive_async_with_progress(file_path: str, file_name: str, pr
         raise
 
 # --- Constantes para la paginación ---
-DRIVE_ITEMS_PER_PAGE = 10
+ITEMS_PER_PAGE = 10
 
-# --- Funciones NUEVAS para gestión directa de la unidad de Drive ---
+# --- Funciones NUEVAS para gestión de archivos SUBIDOS POR EL BOT ---
 
-async def list_drive_contents_async(page_number: int = 1, folder_id: str = 'root'):
+async def list_uploaded_files_async(page_number: int = 1):
     """
-    Lista el contenido de una carpeta/unidad de Google Drive usando las credenciales del bot.
-    Por defecto, lista 'My Drive' (folder_id='root'). Para unidad compartida, usa su ID.
-
-    Args:
-        page_number (int): Número de página a mostrar (comenzando desde 1).
-        folder_id (str): ID de la carpeta/unidad a listar. 'root' para My Drive.
-
-    Returns:
-        dict: Diccionario con 'files' (lista de archivos), 'total_files', 'pages', 'current_page'.
+    Lista SOLO los archivos que el bot ha subido, obteniendo detalles de la API de Drive.
     """
-    print(f"Iniciando listado asíncrono del contenido de Drive (pagina {page_number}, folder_id={folder_id})...")
-    
-    load_credentials() 
+    print(f"Iniciando listado asíncrono de archivos SUBIDOS POR EL BOT (pagina {page_number})...")
+    load_credentials()
     loop = asyncio.get_event_loop()
     service = await loop.run_in_executor(None, get_drive_service)
 
-    def list_drive_task():
-        print("Ejecutando tarea de listado de contenido de Drive en thread...")
+    def list_task():
+        print("Ejecutando tarea de listado de archivos subidos en thread...")
         try:
-            # Calcular el índice de inicio para la paginación
-            start_index = (page_number - 1) * DRIVE_ITEMS_PER_PAGE
+            # 1. Obtener la lista de file_ids de nuestra DB local
+            uploaded_entries = get_uploaded_files() # Devuelve [{'file_id', 'original_name'}, ...]
             
-            # Listar archivos/carpetas dentro de la carpeta/unidad especificada
-            # fields minimiza la cantidad de datos transferidos
-            # orderBy ordena por nombre
-            # q filtra por items no borrados en la carpeta padre
-            results = service.files().list(
-                q=f"'{folder_id}' in parents and trashed = false",
-                pageSize=DRIVE_ITEMS_PER_PAGE,
-                fields="nextPageToken, files(id, name, size, mimeType, createdTime)",
-                orderBy="createdTime desc", # Más recientes primero
-                pageToken=None # Simplificación para paginación básica
-            ).execute()
+            # --- CORRECCIÓN CLAVE ---
+            # Verificar si hay entradas antes de proceder
+            if not uploaded_entries:
+                 print("No hay archivos registrados como subidos por el bot.")
+                 # Devolver una estructura de datos consistente
+                 return {
+                    'files': [], # Lista vacía de archivos
+                    'total_files': 0, # Total 0
+                    'pages': 1, # 1 página
+                    'current_page': page_number # Página solicitada
+                }
             
-            items = results.get('files', [])
-            
-            # Asegurar que 'size' sea un entero (0 si no existe o es inválido)
+            # 2. Extraer solo los IDs
+            file_ids = [entry['file_id'] for entry in uploaded_entries]
+            # Crear un mapa para obtener el nombre original rápidamente
+            file_id_to_name = {entry['file_id']: entry['original_name'] for entry in uploaded_entries}
+
+            # 3. Consultar la API de Drive para obtener detalles (nombre, tamaño) de esos archivos específicos
+            # Verificar si hay archivos para evitar errores
+            if not file_ids:
+                 items = []
+            else:
+                 items = []
+                 # Procesar en lotes pequeños para evitar límites de la API y errores de sintaxis compleja
+                 batch_size = 50 # Un tamaño de lote razonable
+                 for i in range(0, len(file_ids), batch_size):
+                     batch_file_ids = file_ids[i:i + batch_size]
+                     print(f"Procesando lote de IDs: {batch_file_ids[:3]}... (total {len(batch_file_ids)})") # Log de diagnóstico
+
+                     # Manejar uno o más IDs de forma robusta DENTRO DEL LOTE
+                     if len(batch_file_ids) == 1:
+                         # Para un solo ID, usar la comparación directa
+                         single_id = batch_file_ids[0]
+                         ids_query = f"id = '{single_id}'"
+                         print(f"  Consulta para 1 archivo (lote): {ids_query}") # Log para diagnóstico
+                     else:
+                         # Para múltiples IDs, usar 'in'
+                         # Formato correcto: "id in ('ID1', 'ID2', ...)"
+                         # Escapar comillas simples en los IDs si es necesario (aunque es raro que las haya)
+                         escaped_ids = [fid.replace("'", "\\'") for fid in batch_file_ids]
+                         ids_query = f"id in ({', '.join(repr(fid) for fid in escaped_ids)})"
+                         print(f"  Consulta para {len(batch_file_ids)} archivos (lote): {ids_query[:100]}...") # Log para diagnóstico
+
+                     try:
+                         # fields minimiza la cantidad de datos transferidos
+                         results = service.files().list(
+                             q=ids_query,
+                             fields="files(id, name, size, mimeType)",
+                             orderBy="name" # Ordenar por nombre
+                         ).execute()
+
+                         batch_items = results.get('files', [])
+                         items.extend(batch_items)
+                         print(f"  Lote procesado, obtenidos {len(batch_items)} archivos.")
+
+                     except HttpError as http_err:
+                         # Registrar error específico de HTTP para este lote
+                         print(f"  Error HTTP al listar lote {i//batch_size + 1}: {http_err}")
+                         print(f"  Consulta fallida: {ids_query}")
+                         # Continuar con el siguiente lote en lugar de fallar todo
+                         continue
+                     except Exception as batch_err:
+                         print(f"  Error inesperado al listar lote {i//batch_size + 1}: {batch_err}")
+                         print(f"  Consulta fallida: {ids_query}")
+                         continue # Continuar con el siguiente lote
+
+            # 4. Asociar el nombre original desde nuestro mapa y procesar tamaño
             processed_items = []
             for item in items:
+                file_id = item['id']
+                # Usar el nombre original guardado en nuestra DB, no el de Drive si fue cambiado
+                original_name = file_id_to_name.get(file_id, item.get('name', 'Nombre_Desconocido'))
+                item['original_name'] = original_name
+                # Asegurar que 'size' sea un entero
                 try:
                     size_bytes = int(item.get('size', 0))
                 except (ValueError, TypeError):
@@ -208,126 +256,111 @@ async def list_drive_contents_async(page_number: int = 1, folder_id: str = 'root
                 item['size'] = size_bytes
                 processed_items.append(item)
 
-            # Para paginación precisa, se necesitaría el conteo total.
-            # Como simplificación, asumimos que si hay items, podría haber más si se llenó la página.
-            total_files_on_page = len(processed_items)
-            pages = page_number if total_files_on_page == DRIVE_ITEMS_PER_PAGE else page_number
-            if total_files_on_page == 0 and page_number > 1:
-                 pages = page_number - 1 # Retroceder una página si está vacía
-            
-            print(f"Listado de contenido de Drive completado. Pagina {page_number}/{pages}, {total_files_on_page} items.")
+            # 5. Calcular paginación sobre los archivos encontrados
+            total_files = len(processed_items)
+            pages = math.ceil(total_files / ITEMS_PER_PAGE) if total_files > 0 else 1
+            start_index = (page_number - 1) * ITEMS_PER_PAGE
+            end_index = start_index + ITEMS_PER_PAGE
+            paginated_items = processed_items[start_index:end_index]
+
+            print(f"Listado de archivos subidos completado. Pagina {page_number}/{pages}, {len(paginated_items)} archivos encontrados en Drive.")
             return {
-                'files': processed_items,
-                'total_files': total_files_on_page, # Aproximado
-                'pages': pages, # Aproximado
-                'current_page': page_number,
-                'has_more': 'nextPageToken' in results # Indicador si hay más páginas
+                'files': paginated_items,
+                'total_files': total_files,
+                'pages': pages,
+                'current_page': page_number
             }
         except Exception as e:
-            print(f"Error interno en la tarea de listado de contenido de Drive: {e}")
+            print(f"Error interno en la tarea de listado de archivos subidos: {e}")
             import traceback
             traceback.print_exc()
             raise
 
     try:
-        result = await loop.run_in_executor(None, list_drive_task)
+        result = await loop.run_in_executor(None, list_task)
         return result
     except Exception as e:
-        print(f"Error durante el listado del contenido de Google Drive (OAuth/Servicio): {e}")
+        print(f"Error durante el listado de archivos subidos de Google Drive (OAuth): {e}")
         import traceback
         traceback.print_exc()
         raise
 
 
-async def delete_drive_file_async(file_id: str):
+async def delete_uploaded_file_async(file_id: str):
     """
-    Borra un archivo de Google Drive usando su ID, usando las credenciales del bot.
-
-    Args:
-        file_id (str): El ID del archivo a borrar.
-
-    Raises:
-        Exception: Si ocurre cualquier error durante el borrado.
+    Borra un archivo subido por el bot de Google Drive y de la base de datos local.
     """
-    print(f"Iniciando borrado asíncrono del archivo {file_id} en Google Drive (OAuth/Servicio)...")
-    
-    load_credentials() 
+    print(f"Iniciando borrado asíncrono del archivo SUBIDO POR EL BOT {file_id} en Google Drive (OAuth)...")
+    load_credentials()
     loop = asyncio.get_event_loop()
     service = await loop.run_in_executor(None, get_drive_service)
 
     def delete_task():
         print(f"Ejecutando tarea de borrado para {file_id} en thread...")
         try:
+            # 1. Borrar de Google Drive
             service.files().delete(fileId=file_id).execute()
             print(f"Archivo {file_id} borrado exitosamente de Google Drive.")
+            # 2. Borrar registro de nuestra DB local
+            remove_uploaded_file_record(file_id)
         except Exception as e:
              print(f"Error interno en la tarea de borrado para {file_id}: {e}")
-             raise # Relanzar para que el handler exterior lo capture
+             # Si falla borrar de Drive, también borramos el registro local?
+             # Depende de la política, pero si el registro local está mal, mejor borrarlo.
+             # Por ahora, intentamos ambas cosas y reportamos errores.
+             remove_uploaded_file_record(file_id) # Intentar borrar registro local también
+             raise
 
     try:
         await loop.run_in_executor(None, delete_task)
     except Exception as e:
-        print(f"Error durante el borrado del archivo {file_id} de Google Drive (OAuth/Servicio): {e}")
+        print(f"Error durante el borrado del archivo {file_id} de Google Drive (OAuth): {e}")
         import traceback
         traceback.print_exc()
-        raise
+        raise # Relanzar para que el handler exterior lo capture
 
-
-async def delete_all_drive_files_async(folder_id: str = 'root'):
+async def delete_all_uploaded_files_async():
     """
-    Borra todos los archivos NO EN LA PAPELERA de una carpeta/unidad de Google Drive.
-    ADVERTENCIA: Esto borrará todos los archivos accesibles por la cuenta del bot en esa carpeta/unidad.
-
-    Args:
-        folder_id (str): ID de la carpeta/unidad. 'root' para My Drive.
+    Borra todos los archivos que el bot ha subido, tanto de Drive como de la DB local.
     """
-    print(f"Iniciando borrado MASIVO de archivos en Google Drive (carpeta {folder_id}) (OAuth/Servicio)...")
-    
-    load_credentials() 
+    print("Iniciando borrado MASIVO de archivos SUBIDOS POR EL BOT en Google Drive (OAuth)...")
+    load_credentials()
     loop = asyncio.get_event_loop()
     service = await loop.run_in_executor(None, get_drive_service)
 
     def delete_all_task():
-        print("Ejecutando tarea de borrado MASIVO en thread...")
+        print("Ejecutando tarea de borrado MASIVO de archivos subidos en thread...")
         try:
-            # Obtener lista de todos los archivos NO EN LA PAPELERA en la carpeta especificada
-            results = service.files().list(
-                q=f"'{folder_id}' in parents and trashed = false",
-                pageSize=1000, # Obtener muchos para minimizar llamadas
-                fields="files(id, name)" # Solo necesitamos ID
-            ).execute()
-            items = results.get('files', [])
-            
-            if not items:
-                print("No se encontraron archivos para borrar en la carpeta especificada.")
+            # 1. Obtener la lista de file_ids de nuestra DB local
+            uploaded_entries = get_uploaded_files()
+
+            if not uploaded_entries:
+                print("No hay archivos registrados como subidos por el bot para borrar.")
                 return
 
-            print(f"Se encontraron {len(items)} archivos para borrar en la carpeta {folder_id}.")
-            
-            # Borrar cada archivo
-            deleted_count = 0
-            failed_count = 0
-            for item in items:
-                file_id = item['id']
-                file_name = item.get('name', 'Desconocido')
+            print(f"Se encontraron {len(uploaded_entries)} archivos registrados para borrar.")
+
+            # 2. Borrar cada archivo de Google Drive
+            for entry in uploaded_entries:
+                file_id = entry['file_id']
                 try:
                     service.files().delete(fileId=file_id).execute()
-                    print(f"Archivo borrado: {file_name} ({file_id})")
-                    deleted_count += 1
+                    print(f"Archivo {file_id} borrado de Google Drive.")
                 except Exception as e:
-                    print(f"Error borrando archivo {file_name} ({file_id}): {e}")
-                    failed_count += 1
+                    print(f"Error borrando archivo {file_id} de Drive: {e}")
                     # No lanzamos excepción aquí para intentar borrar los demás
-            
-            print(f"Borrado MASIVO completado en carpeta {folder_id}. Éxito: {deleted_count}, Fallidos: {failed_count}.")
+
+            # 3. Borrar todos los registros de la DB local
+            clear_all_uploaded_file_records()
+            print("Borrado MASIVO de archivos subidos completado.")
         except Exception as e:
-             print(f"Error interno en la tarea de borrado MASIVO: {e}")
+             print(f"Error interno en la tarea de borrado MASIVO de archivos subidos: {e}")
              raise
 
     try:
         await loop.run_in_executor(None, delete_all_task)
     except Exception as e:
-        print(f"Error durante el borrado MASIVO de archivos de Google Drive (OAuth/Servicio): {e}")
+        print(f"Error durante el borrado MASIVO de archivos subidos de Google Drive (OAuth): {e}")
         import traceback
         traceback.print_exc()
         raise
